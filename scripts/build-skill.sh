@@ -28,6 +28,7 @@ git archive --format=zip --prefix=watch/ --output="$OUT" HEAD
 zip -d "$OUT" \
   "watch/hooks/*" \
   "watch/commands/*" \
+  "watch/skills/*" \
   "watch/.claude-plugin/*" \
   > /dev/null 2>&1 || true
 
