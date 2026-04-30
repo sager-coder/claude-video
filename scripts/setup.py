@@ -13,7 +13,10 @@ Design:
   keys and only appends missing ones.
 - SETUP_COMPLETE=true in ~/.config/watch/.env tells us the user has been
   through a successful installer run at least once.
-- Never sudo. On macOS, auto-install via brew. Elsewhere, print exact commands.
+- Never interactive sudo. On macOS, auto-install via brew. On Linux,
+  auto-install via apt-get/dnf when running as root or with passwordless
+  sudo (e.g. Cowork sandboxes); otherwise print exact commands. Windows
+  and other platforms: print commands.
 - Never write an API key to disk automatically — only scaffold placeholders.
 """
 from __future__ import annotations
@@ -176,6 +179,93 @@ def _install_macos(missing: list[str]) -> tuple[bool, str]:
     return True, f"installed via brew: {', '.join(pkgs)}"
 
 
+def _root_prefix() -> tuple[bool, list[str]]:
+    """Return (ok, prefix) for running a privileged command without prompting.
+
+    prefix is empty when running as root, ['sudo', '-n'] when passwordless
+    sudo is available. Returns (False, []) when neither works — caller should
+    fall back to printing install hints.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True, []
+    if _which("sudo") is not None:
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if r.returncode == 0:
+                return True, ["sudo", "-n"]
+        except OSError:
+            pass
+    return False, []
+
+
+def _install_linux(missing: list[str]) -> tuple[bool, str]:
+    """Best-effort Linux auto-install for ffmpeg + yt-dlp.
+
+    ffmpeg via apt-get/dnf (needs root or passwordless sudo).
+    yt-dlp via pipx (preferred) or `pip --user` (no privilege needed).
+    Falls back to install hints if a step would require an interactive prompt.
+    """
+    pkgs = _brew_pkg(missing)
+    need_ffmpeg = "ffmpeg" in pkgs
+    need_ytdlp = "yt-dlp" in pkgs
+    installed: list[str] = []
+
+    if need_ffmpeg:
+        if _which("apt-get") is not None:
+            install_cmd = ["apt-get", "install", "-y", "ffmpeg"]
+            update_cmd: list[str] | None = ["apt-get", "update", "-y"]
+        elif _which("dnf") is not None:
+            install_cmd = ["dnf", "install", "-y", "ffmpeg"]
+            update_cmd = None
+        else:
+            return False, (
+                "no apt-get or dnf found. install ffmpeg manually:\n  "
+                + _install_hint_linux(["ffmpeg"])
+            )
+        ok, prefix = _root_prefix()
+        if not ok:
+            return False, (
+                "ffmpeg install needs root and no passwordless sudo is available. "
+                "run one of:\n  " + _install_hint_linux(["ffmpeg"])
+            )
+        if update_cmd is not None:
+            cmd = [*prefix, *update_cmd]
+            print(f"[setup] running: {' '.join(cmd)}", file=sys.stderr)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL)
+        cmd = [*prefix, *install_cmd]
+        print(f"[setup] running: {' '.join(cmd)}", file=sys.stderr)
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            return False, f"{install_cmd[0]} install ffmpeg failed (exit {r.returncode})"
+        installed.append("ffmpeg")
+
+    if need_ytdlp:
+        if _which("pipx") is not None:
+            ytdlp_cmd = ["pipx", "install", "yt-dlp"]
+        elif _which("pip3") is not None:
+            ytdlp_cmd = ["pip3", "install", "--user", "yt-dlp"]
+        elif _which("pip") is not None:
+            ytdlp_cmd = ["pip", "install", "--user", "yt-dlp"]
+        else:
+            return False, (
+                "no pipx/pip found. install yt-dlp manually:\n  "
+                + _install_hint_linux(["yt-dlp"])
+            )
+        print(f"[setup] running: {' '.join(ytdlp_cmd)}", file=sys.stderr)
+        r = subprocess.run(ytdlp_cmd)
+        if r.returncode != 0:
+            return False, f"{ytdlp_cmd[0]} install yt-dlp failed (exit {r.returncode})"
+        installed.append("yt-dlp")
+
+    if not installed:
+        return True, "nothing to install"
+    return True, f"installed on linux: {', '.join(installed)}"
+
+
 def _install_hint_linux(missing: list[str]) -> str:
     pkgs = _brew_pkg(missing)
     hints = []
@@ -275,9 +365,15 @@ def cmd_install() -> int:
                 return 2
             installed_deps = True
         elif system == "Linux":
-            print("[setup] dependencies missing on Linux — please install:", file=sys.stderr)
-            print("  " + _install_hint_linux(missing), file=sys.stderr)
-            return 2
+            ok, msg = _install_linux(missing)
+            print(f"[setup] {msg}", file=sys.stderr)
+            if not ok:
+                return 2
+            still_missing = _check_binaries()
+            if still_missing:
+                print(f"[setup] still missing after install: {', '.join(still_missing)}", file=sys.stderr)
+                return 2
+            installed_deps = True
         elif system == "Windows":
             print("[setup] dependencies missing on Windows — please install:", file=sys.stderr)
             print("  " + _install_hint_windows(missing), file=sys.stderr)
